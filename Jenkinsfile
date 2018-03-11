@@ -193,24 +193,28 @@ pipeline {
                                     "-i", "${productionProject}/horse-ride-service-${newColor}:production"
                                 )
 
-                                serviceApp.narrow('svc').expose()
-
                             } else {
                                 /* nothing to do here: the deploymentconfig exists
                                  * and a new deployment was already triggered by tagging the image above */
                             }
 
                             /* Use Spring Boot Actuator's /health endpoint as a readiness and liveness probe */
-                            openshift.set('probe', "dc/horse-ride-service", '--readiness',
-                                '--get-url=http://:8080/health', '--initial-delay-seconds=5', '--period-seconds=2')
-                            openshift.set('probe', "dc/horse-ride-service", '--liveness',
-                                '--get-url=http://:8080/health', '--initial-delay-seconds=15', '--period-seconds=2')
+                            openshift.set('probe', "dc/horse-ride-service-${newColor}", '--readiness',
+                                '--get-url=http://:8080/api/unhealth', '--initial-delay-seconds=5', '--period-seconds=2')
+                            openshift.set('probe', "dc/horse-ride-service-${newColor}", '--liveness',
+                                '--get-url=http://:8080/api/unhealth', '--initial-delay-seconds=15', '--period-seconds=2')
 
                             scale("horse-ride-service-${newColor}", 1, false)
 
                             /* The deployment triggered by new-app or push to image stream needs some time to finish
                              * oc rollout status --watch makes this script wait till the deployment is ready */
                             dc.rollout().status('--watch')
+
+                            def newColorRoute = openshift.selector("route/horse-ride-service-${newColor}")
+                            if (!newColorRoute.exists()) {
+                                openshift.selector("svc/horse-ride-service-${newColor}").expose()
+                            }
+                            def newColorHealthUrl = "http://"+ newColorRoute.object().spec.host +"/api/unhealth"
 
                             /* Take the old color-less resources down if they still exist to save some system resources */
                             deleteExisting("svc/horse-ride-service", "dc/horse-ride-service", "is/horse-ride-service")
@@ -219,18 +223,36 @@ pipeline {
                                 /* No route yet, probably the first execution of the pipeline */
                                 openshift.selector("svc/horse-ride-service-${newColor}").expose("--name=horse-ride-service")
                             } else {
-                                def routeModel = route.object()
-                                def serviceModel = routeModel.spec.to
-                                serviceModel.name = "horse-ride-service-${newColor}"
-                                serviceModel.weight = 100
-                                routeModel.spec.alternateBackends = []
-                                openshift.apply(routeModel)
-                            }
 
-                            def serviceUrl = 'http://' + route.object().spec.host
-                            echo "The ${newColor} image was promoted to production: ${serviceUrl}"
-                            echo 'To roll back to ${oldColor} manually, run'
-                            echo '    oc patch route/horse-ride-service -p \'{"spec":{"to":{"name":"horse-ride-service-'+ oldColor + '"}}}\' -n '+ productionProject
+                                /* Send 50% of the traffic to the new version of the service */
+                                echo "Splitting trafic old 50 : new 50"
+                                splitTraffic(openshift, oldColor, 50, newColor, 50)
+                                def log = [1,1,1]
+                                for (int i = 0; i < 10; i++) {
+                                    sleep 2
+                                    def healthStatus = sh (
+                                        script: "curl --connect-timeout 1 -o /dev/null -X GET -sL -w '%{http_code}' -H 'Content-Type: application/json' ${newColorHealthUrl}",
+                                        returnStdout: true
+                                    )
+                                    echo "The health endpoint returned "+ healthStatus
+                                    log[i % 3] = (healthStatus == "200" ? 1 : 0)
+                                    if (log.sum() == 0) {
+                                        /* rollback because of 3 consecutive failures */
+                                        splitTraffic(openshift, oldColor, 100, newColor, 0)
+			                            def serviceUrl = 'http://' + openshift.selector('route/horse-ride-service').object().spec.host
+                                        echo "Canary died :( reverting the route to send all traffic to original image: ${serviceUrl}"
+                                        error("Canary died")
+                                    }
+                                }
+                            }
+                            /* Canary survived for ~20 seconds - let's consider it stable */
+                            splitTraffic(openshift, newColor, 100, oldColor, 0)
+
+                            /* Idle the old version to save some system resources */
+                            scale("horse-ride-service-${oldColor}", 0, false)
+
+                            def serviceUrl = 'http://' + openshift.selector('route/horse-ride-service').object().spec.host
+                            echo 'Canary survived and now serves 100% of prod traffic: ' + serviceUrl
                         }
                     }
                 }
@@ -263,6 +285,21 @@ def scale(String dcName, int replicas, boolean watch) {
             dc.rollout().status('--watch')
         }
     }
+}
+
+def splitTraffic(openshift, primaryColor, primaryWeight, altColor, altWeight) {
+    def routeModel = openshift.selector('route/horse-ride-service').object()
+    def primaryService = routeModel.spec.to
+    primaryService.name = "horse-ride-service-${primaryColor}"
+    primaryService.weight = primaryWeight
+    routeModel.spec.alternateBackends = [
+        [
+            kind: "Service",
+            name: "horse-ride-service-${altColor}",
+            weight: altWeight
+        ]
+    ]
+    openshift.apply(routeModel)
 }
 
 @NonCPS
