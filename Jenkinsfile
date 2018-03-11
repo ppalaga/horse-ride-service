@@ -89,6 +89,105 @@ pipeline {
                 }
             }
         }
+        stage('Stage') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject(stageProject) {
+                            deployPostgresIfNeeded(openshift)
+
+                            /* Promote the image from test to stage by re-tagging it.
+                             * This will trigger a rollout of the new image if the DeploymentConfig
+                             * based on that tag exists already */
+                            openshift.tag("${cicdProject}/horse-ride-service:test", "${stageProject}/horse-ride-service:stage")
+
+                            def dc = openshift.selector('dc/horse-ride-service')
+                            if (!dc.exists()) {
+                                /* The deploymentconfig does not exist yet - the pipeline is probably run for the first time */
+                                def serviceApp = openshift.newApp(
+                                    "--name=horse-ride-service",
+                                    "-e", "RIDE_DB_HOST=horse-ride-service-postgresql",
+                                    "-e", "RIDE_DB_PORT=5432",
+                                    "-e", "RIDE_DB_NAME=${pgDb}",
+                                    "-e", "RIDE_DB_USERNAME=${pgUser}",
+                                    "-e", "RIDE_DB_PASSWORD=${pgPassword}",
+                                    "-e", "RIDE_DB_DLL_AUTO=update",
+                                    "-i", "${stageProject}/horse-ride-service:stage"
+                                )
+                                /* Use Spring Boot Actuator's /health endpoint as a readiness and liveness probe */
+                                openshift.set('probe', 'dc/horse-ride-service', '--readiness',
+                                    '--get-url=http://:8080/health', '--initial-delay-seconds=5', '--period-seconds=2')
+                                openshift.set('probe', 'dc/horse-ride-service', '--liveness',
+                                    '--get-url=http://:8080/health', '--initial-delay-seconds=10', '--period-seconds=2')
+
+                                serviceApp.narrow('svc').expose()
+
+                            } else {
+                                /* nothing to do here: the deploymentconfig exists
+                                 * and a new deployment was already triggered by tagging the image above */
+                            }
+
+                            /* The deployment triggered by new-app or push to image stream needs some time to finish
+                             * oc rollout status --watch makes this script wait till the deployment is ready */
+                            dc.rollout().status('--watch')
+
+                            def serviceUrl = 'http://' + openshift.selector('route/horse-ride-service').object().spec.host
+
+                            /* Ask for manual approval */
+                            input 'Promote the staged image ' + serviceUrl + ' to Production?'
+
+                        }
+                    }
+                }
+            }
+        }
+        stage('Production') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject(productionProject) {
+                            deployPostgresIfNeeded(openshift)
+
+                            openshift.tag("${stageProject}/horse-ride-service:stage", "${productionProject}/horse-ride-service:production")
+
+                            def dc = openshift.selector("dc/horse-ride-service")
+                            if (!dc.exists()) {
+                                /* The deploymentconfig does not exist yet - the pipeline is probably run for the first time */
+                                def serviceApp = openshift.newApp(
+                                    "--name=horse-ride-service",
+                                    "-e", "RIDE_DB_HOST=horse-ride-service-postgresql",
+                                    "-e", "RIDE_DB_PORT=5432",
+                                    "-e", "RIDE_DB_NAME=${pgDb}",
+                                    "-e", "RIDE_DB_USERNAME=${pgUser}",
+                                    "-e", "RIDE_DB_PASSWORD=${pgPassword}",
+                                    "-e", "RIDE_DB_DLL_AUTO=update",
+                                    "-i", "${productionProject}/horse-ride-service:production"
+                                )
+
+                                serviceApp.narrow('svc').expose()
+
+                            } else {
+                                /* nothing to do here: the deploymentconfig exists
+                                 * and a new deployment was already triggered by tagging the image above */
+                            }
+
+                            /* Use Spring Boot Actuator's /health endpoint as a readiness and liveness probe */
+                            openshift.set('probe', "dc/horse-ride-service", '--readiness',
+                                '--get-url=http://:8080/health', '--initial-delay-seconds=5', '--period-seconds=2')
+                            openshift.set('probe', "dc/horse-ride-service", '--liveness',
+                                '--get-url=http://:8080/health', '--initial-delay-seconds=15', '--period-seconds=2')
+
+                            /* The deployment triggered by new-app or push to image stream needs some time to finish
+                             * oc rollout status --watch makes this script wait till the deployment is ready */
+                            dc.rollout().status('--watch')
+
+                            def serviceUrl = 'http://' + openshift.selector("route/horse-ride-service").object().spec.host
+                            echo "The new image was promoted to production: ${serviceUrl}"
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
