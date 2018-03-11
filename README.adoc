@@ -1,0 +1,10 @@
+= `horse-ride-service`
+
+The source code to http://ppalaga.github.io/presentations/180312-voxxed-vienna/index.html[Blue-green Deployments and Canary Releases on Kubernetes] talk of
+https://twitter.com/ppalaga[Peter Palaga] and https://twitter.com/marek_jelen[Marek Jelen]
+
+
+== How to work with this project
+
+You best follow the http://ppalaga.github.io/presentations/180312-voxxed-vienna/index.html[slides] of the talk.
+They will guide you through the commits in this repository and will also explain what the commits are supposed to do.
