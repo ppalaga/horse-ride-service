@@ -19,6 +19,7 @@ pipeline {
                     openshift.withCluster() {
                         openshift.withProject(cicdProject) {
                             deployPostgresIfNeeded(openshift)
+                            scale('horse-ride-service-postgresql', 1, true)
                         }
                     }
 
@@ -74,6 +75,7 @@ pipeline {
                                 /* nothing to do here: the deploymentconfig exist
                                  * and a new deployment was already triggered by push to docker registry
                                  * by ${mvn} fabric8:build above */
+                                scale('horse-ride-service', 1, false)
                             }
 
                             /* The deployment triggered by new-app or push to image stream needs some time to finish
@@ -84,6 +86,10 @@ pipeline {
                             sh ("HORSE_RIDE_SERVICE_HOST=horse-ride-service" +
                                 " HORSE_RIDE_SERVICE_PORT=8080" +
                                 " ${mvn} failsafe:integration-test failsafe:verify -Popenshift")
+
+                            /* Idle these to free some system resources */
+                            scale('horse-ride-service', 0, false)
+                            scale('horse-ride-service-postgresql', 0, false)
                         }
                     }
                 }
@@ -95,6 +101,7 @@ pipeline {
                     openshift.withCluster() {
                         openshift.withProject(stageProject) {
                             deployPostgresIfNeeded(openshift)
+                            scale('horse-ride-service-postgresql', 1, true)
 
                             /* Promote the image from test to stage by re-tagging it.
                              * This will trigger a rollout of the new image if the DeploymentConfig
@@ -120,12 +127,19 @@ pipeline {
                                 openshift.set('probe', 'dc/horse-ride-service', '--liveness',
                                     '--get-url=http://:8080/health', '--initial-delay-seconds=10', '--period-seconds=2')
 
-                                serviceApp.narrow('svc').expose()
-
+                                def serviceRoute = openshift.selector('route/horse-ride-service');
+                                if (!serviceRoute.exists()) {
+                                    serviceApp.narrow('svc').expose()
+                                } else {
+                                    def routeModel = serviceRoute.object()
+                                    routeModel.spec.to.name = "horse-ride-service"
+                                    openshift.apply(routeModel)
+                                }
                             } else {
                                 /* nothing to do here: the deploymentconfig exists
                                  * and a new deployment was already triggered by tagging the image above */
                             }
+                            scale('horse-ride-service', 1, false)
 
                             /* The deployment triggered by new-app or push to image stream needs some time to finish
                              * oc rollout status --watch makes this script wait till the deployment is ready */
@@ -136,6 +150,9 @@ pipeline {
                             /* Ask for manual approval */
                             input 'Promote the staged image ' + serviceUrl + ' to Production?'
 
+                            /* Idle these to free some system resources */
+                            scale('horse-ride-service', 0, false)
+                            scale('horse-ride-service-postgresql', 0, false)
                         }
                     }
                 }
@@ -148,20 +165,32 @@ pipeline {
                         openshift.withProject(productionProject) {
                             deployPostgresIfNeeded(openshift)
 
-                            openshift.tag("${stageProject}/horse-ride-service:stage", "${productionProject}/horse-ride-service:production")
+                            def newColor = 'blue'
+                            def oldColor = 'green'
+                            def route = openshift.selector('route/horse-ride-service')
+                            if (route.exists()) {
+                                def activeService = route.object().spec.to.name
+                                if (activeService.endsWith('blue')) {
+                                    newColor = 'green'
+                                    oldColor = 'blue'
+                                }
+                            }
+                            echo "The new color is ${newColor}"
 
-                            def dc = openshift.selector("dc/horse-ride-service")
+                            openshift.tag("${stageProject}/horse-ride-service:stage", "${productionProject}/horse-ride-service-${newColor}:production")
+
+                            def dc = openshift.selector("dc/horse-ride-service-${newColor}")
                             if (!dc.exists()) {
                                 /* The deploymentconfig does not exist yet - the pipeline is probably run for the first time */
                                 def serviceApp = openshift.newApp(
-                                    "--name=horse-ride-service",
+                                    "--name=horse-ride-service-${newColor}",
                                     "-e", "RIDE_DB_HOST=horse-ride-service-postgresql",
                                     "-e", "RIDE_DB_PORT=5432",
                                     "-e", "RIDE_DB_NAME=${pgDb}",
                                     "-e", "RIDE_DB_USERNAME=${pgUser}",
                                     "-e", "RIDE_DB_PASSWORD=${pgPassword}",
                                     "-e", "RIDE_DB_DLL_AUTO=update",
-                                    "-i", "${productionProject}/horse-ride-service:production"
+                                    "-i", "${productionProject}/horse-ride-service-${newColor}:production"
                                 )
 
                                 serviceApp.narrow('svc').expose()
@@ -177,12 +206,29 @@ pipeline {
                             openshift.set('probe', "dc/horse-ride-service", '--liveness',
                                 '--get-url=http://:8080/health', '--initial-delay-seconds=15', '--period-seconds=2')
 
+                            scale("horse-ride-service-${newColor}", 1, false)
+
                             /* The deployment triggered by new-app or push to image stream needs some time to finish
                              * oc rollout status --watch makes this script wait till the deployment is ready */
                             dc.rollout().status('--watch')
 
-                            def serviceUrl = 'http://' + openshift.selector("route/horse-ride-service").object().spec.host
-                            echo "The new image was promoted to production: ${serviceUrl}"
+                            /* Take the old color-less resources down if they still exist to save some system resources */
+                            deleteExisting("svc/horse-ride-service", "dc/horse-ride-service", "is/horse-ride-service")
+
+                            if (!route.exists()) {
+                                /* No route yet, probably the first execution of the pipeline */
+                                openshift.selector("svc/horse-ride-service-${newColor}").expose("--name=horse-ride-service")
+                            } else {
+                                def routeModel = route.object()
+                                def serviceModel = routeModel.spec.to
+                                serviceModel.name = "horse-ride-service-${newColor}"
+                                serviceModel.weight = 100
+                                routeModel.spec.alternateBackends = []
+                                openshift.apply(routeModel)
+                            }
+
+                            def serviceUrl = 'http://' + route.object().spec.host
+                            echo "The ${newColor} image was promoted to production: ${serviceUrl}"
                         }
                     }
                 }
@@ -205,4 +251,25 @@ def deployPostgresIfNeeded(openshift) {
            oc rollout status --watch makes this script wait till the deployment is ready */
         dbApp.narrow('dc').rollout().status('--watch')
     }
+}
+
+def scale(String dcName, int replicas, boolean watch) {
+    def dc = openshift.selector("dc/${dcName}")
+    if (dc.exists() && dc.object().spec.replicas != replicas) {
+        dc.scale("--replicas=${replicas}")
+        if (watch) {
+            dc.rollout().status('--watch')
+        }
+    }
+}
+
+@NonCPS
+def deleteExisting(String... kindNames) {
+    for (String kindName : kindNames) {
+        def sel = openshift.selector(kindName)
+        if (sel.exists()) {
+            sel.delete()
+        }
+    }
+    return
 }
