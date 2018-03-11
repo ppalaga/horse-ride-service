@@ -229,6 +229,8 @@ pipeline {
 
                             def serviceUrl = 'http://' + route.object().spec.host
                             echo "The ${newColor} image was promoted to production: ${serviceUrl}"
+                            echo 'To roll back to ${oldColor} manually, run'
+                            echo '    oc patch route/horse-ride-service -p \'{"spec":{"to":{"name":"horse-ride-service-'+ oldColor + '"}}}\' -n '+ productionProject
                         }
                     }
                 }
