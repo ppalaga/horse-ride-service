@@ -26,7 +26,7 @@ public class UnhealthEndpoint implements Serializable {
     @Value("${demo.git.revision}")
     private String revision;
 
-    private Status status = Status.OK;
+    private Status status = Status.SERVICE_UNAVAILABLE;
 
     /**
      *
